@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# HuggingFace cache
+.hf_cache/
+
+# Data files (download locally, don't commit)
+data/raw/
+data/hdfs/
+data/bgl/
+data/thunderbird/
+
+# Saved models
+saved_models/
+
+# Results
+results/
+
+# Logs
+*.log
+distill_logs/
+
+# OS
+.DS_Store

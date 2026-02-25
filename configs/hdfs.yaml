@@ -1,0 +1,43 @@
+# HDFS dataset configuration
+dataset:
+  name: HDFS
+  num_templates: 29
+  structured_csv: "data/raw/HDFS_2k.log_structured.csv"
+  processed_dir: "data/hdfs"
+  content_col: "Content"
+  event_col: "EventId"
+  max_samples: null # use all for 2k, set for full dataset
+
+model:
+  depths: 6
+  dim: 768
+  heads: 8
+  max_length: 128
+  num_step: 16 # SNN timesteps
+  tau: 10.0
+  common_thr: 1.0
+  tokenizer: "bert-base-cased"
+
+teacher:
+  model_name: "bert-base-cased"
+  lr: 5e-5
+  epochs: 4
+  batch_size: 32
+  save_dir: "saved_models/teacher/hdfs"
+
+distill:
+  lr: 5e-4
+  epochs: 30
+  batch_size: 16
+  ce_weight: 0.1
+  emb_weight: 0.1
+  logit_weight: 1.0
+  rep_weight: 0.1
+  ignored_layers: 0
+  save_dir: "saved_models/distilled/hdfs"
+
+direct:
+  lr: 5e-4
+  epochs: 50
+  batch_size: 16
+  save_dir: "saved_models/direct/hdfs"

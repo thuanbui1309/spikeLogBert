@@ -1,0 +1,43 @@
+# BGL dataset configuration (placeholder)
+dataset:
+  name: BGL
+  num_templates: null # TBD - need to count from structured CSV
+  structured_csv: "data/raw/BGL_2k.log_structured.csv"
+  processed_dir: "data/bgl"
+  content_col: "Content"
+  event_col: "EventId"
+  max_samples: null
+
+model:
+  depths: 6
+  dim: 768
+  heads: 8
+  max_length: 128
+  num_step: 16
+  tau: 10.0
+  common_thr: 1.0
+  tokenizer: "bert-base-cased"
+
+teacher:
+  model_name: "bert-base-cased"
+  lr: 5e-5
+  epochs: 4
+  batch_size: 32
+  save_dir: "saved_models/teacher/bgl"
+
+distill:
+  lr: 5e-4
+  epochs: 30
+  batch_size: 16
+  ce_weight: 0.1
+  emb_weight: 0.1
+  logit_weight: 1.0
+  rep_weight: 0.1
+  ignored_layers: 0
+  save_dir: "saved_models/distilled/bgl"
+
+direct:
+  lr: 5e-4
+  epochs: 50
+  batch_size: 16
+  save_dir: "saved_models/direct/bgl"
