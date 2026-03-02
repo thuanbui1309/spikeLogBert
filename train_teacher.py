@@ -8,7 +8,6 @@ Usage:
 """
 
 import os
-import time
 import argparse
 import torch
 import torch.nn as nn
@@ -18,8 +17,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import BertTokenizer, BertForSequenceClassification
 
-from data.dataset import LogParsingDataset
-from utils import set_seed, to_device, check_and_create_path
+from data.dataset import TokenizedLogParsingDataset
+from utils import set_seed, check_and_create_path
 
 
 def parse_args():
@@ -33,6 +32,7 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=128)
     parser.add_argument("--save_dir", type=str, default="saved_models/teacher")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
     return parser.parse_args()
 
 
@@ -54,14 +54,29 @@ def train(args):
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    # Load datasets
-    train_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "train.txt"))
-    val_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "val.txt"))
-    test_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "test.txt"))
+    # Load pre-tokenized datasets
+    train_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "train.txt"), tokenizer, args.max_length
+    )
+    val_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "val.txt"), tokenizer, args.max_length
+    )
+    test_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "test.txt"), tokenizer, args.max_length
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
 
     print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
 
@@ -71,15 +86,12 @@ def train(args):
         model.train()
         train_losses = []
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]"):
-            messages, labels = batch
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             labels = labels.to(device)
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
 
-            outputs = model(**inputs)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = F.cross_entropy(outputs.logits, labels)
             train_losses.append(loss.item())
 
@@ -90,8 +102,8 @@ def train(args):
         avg_train_loss = sum(train_losses) / len(train_losses)
 
         # ---- Evaluate ----
-        val_acc = _evaluate(model, val_loader, tokenizer, args.max_length, device)
-        test_acc = _evaluate(model, test_loader, tokenizer, args.max_length, device)
+        val_acc = _evaluate(model, val_loader, device)
+        test_acc = _evaluate(model, test_loader, device)
 
         print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.4f}, val_acc={val_acc:.4f}, test_acc={test_acc:.4f}")
 
@@ -112,22 +124,19 @@ def train(args):
     return save_path
 
 
-def _evaluate(model, data_loader, tokenizer, max_length, device):
-    """Evaluate classification accuracy."""
+def _evaluate(model, data_loader, device):
+    """Evaluate classification accuracy (pre-tokenized data)."""
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for batch in data_loader:
-            messages, labels = batch
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             labels = labels.to(device)
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=max_length
-            )
-            to_device(inputs, device)
 
-            outputs = model(**inputs)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             preds = torch.argmax(outputs.logits, dim=-1)
             correct += (preds == labels).sum().item()
             total += len(labels)

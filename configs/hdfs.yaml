@@ -13,7 +13,7 @@ model:
   dim: 768
   heads: 8
   max_length: 128
-  num_step: 16 # SNN timesteps
+  num_step: 4 # SNN timesteps (SpikeBERT default = 4)
   tau: 10.0
   common_thr: 1.0
   tokenizer: "bert-base-cased"
@@ -28,7 +28,7 @@ teacher:
 distill:
   lr: 5e-4
   epochs: 30
-  batch_size: 16
+  batch_size: 8
   ce_weight: 0.1
   emb_weight: 0.1
   logit_weight: 1.0
@@ -39,5 +39,5 @@ distill:
 direct:
   lr: 5e-4
   epochs: 50
-  batch_size: 16
+  batch_size: 8
   save_dir: "saved_models/direct/hdfs"

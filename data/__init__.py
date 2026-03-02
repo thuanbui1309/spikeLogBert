@@ -1,3 +1,3 @@
-from .dataset import LogParsingDataset, create_log_parsing_data
+from .dataset import LogParsingDataset, TokenizedLogParsingDataset, create_log_parsing_data
 
-__all__ = ["LogParsingDataset", "create_log_parsing_data"]
+__all__ = ["LogParsingDataset", "TokenizedLogParsingDataset", "create_log_parsing_data"]

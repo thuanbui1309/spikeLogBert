@@ -21,12 +21,12 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import BertTokenizer
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, accuracy_score
 from spikingjelly.activation_based import functional
 
 from model import SpikeLogBERT
-from data.dataset import LogParsingDataset
-from utils import set_seed, to_device
+from data.dataset import TokenizedLogParsingDataset
+from utils import set_seed
 
 
 def parse_args():
@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument("--depths", type=int, default=6)
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--num_step", type=int, default=16)
+    parser.add_argument("--num_step", type=int, default=4)
     parser.add_argument("--tau", type=float, default=10.0)
     parser.add_argument("--common_thr", type=float, default=1.0)
     parser.add_argument("--tokenizer_path", type=str, default="bert-base-cased")
@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--split", type=str, default="test", choices=["test", "val", "train"])
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
 
     return parser.parse_args()
 
@@ -71,10 +72,13 @@ def evaluate(args):
     model.eval()
     print(f"Loaded model from {args.model_path}")
 
-    # Load data
+    # Load pre-tokenized data
     split_file = os.path.join(args.dataset_dir, f"{args.split}.txt")
-    dataset = LogParsingDataset(split_file)
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    dataset = TokenizedLogParsingDataset(split_file, tokenizer, args.max_length)
+    data_loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
     print(f"Evaluating on {args.split} split: {len(dataset)} samples")
 
     # Load label mapping (if exists)
@@ -94,21 +98,14 @@ def evaluate(args):
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating"):
-            messages, labels = batch
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
 
-            _, outputs = model(inputs['input_ids'])
-            outputs = outputs.to("cpu")
-            outputs = outputs.reshape(-1, args.num_step, args.label_num)
-            outputs = outputs.transpose(0, 1)  # T B C
-            logits = torch.mean(outputs, dim=0)  # B C
+            _, outputs = model(input_ids)
+            logits = torch.mean(outputs, dim=1)  # B C
 
             preds = torch.argmax(logits, dim=-1)
-            all_preds.extend(preds.tolist())
+            all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.tolist())
 
             functional.reset_net(model)

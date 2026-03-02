@@ -21,8 +21,8 @@ from transformers import BertTokenizer
 from spikingjelly.activation_based import functional
 
 from model import SpikeLogBERT
-from data.dataset import LogParsingDataset
-from utils import set_seed, to_device, check_and_create_path
+from data.dataset import TokenizedLogParsingDataset
+from utils import set_seed, check_and_create_path
 
 
 def parse_args():
@@ -36,16 +36,17 @@ def parse_args():
     parser.add_argument("--depths", type=int, default=6)
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--num_step", type=int, default=16)
+    parser.add_argument("--num_step", type=int, default=4)
     parser.add_argument("--tau", type=float, default=10.0)
     parser.add_argument("--common_thr", type=float, default=1.0)
     parser.add_argument("--tokenizer_path", type=str, default="bert-base-cased")
 
     # Training
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
 
     # Save
     parser.add_argument("--save_dir", type=str, default="saved_models/direct")
@@ -75,16 +76,26 @@ def train(args):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=5e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0)
 
-    # Data
-    train_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "train.txt"))
-    test_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "test.txt"))
+    # Pre-tokenized data
+    train_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "train.txt"), tokenizer, args.max_length
+    )
+    test_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "test.txt"), tokenizer, args.max_length
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True
+    )
 
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
@@ -95,21 +106,12 @@ def train(args):
         losses = []
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            messages, labels = batch
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
             labels = labels.to(device)
 
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
-
-            _, outputs = model(inputs['input_ids'])
-
-            # outputs: could be (B*T, C) or (B, T, C) depending on DataParallel
-            outputs = outputs.reshape(-1, args.num_step, args.label_num)
-            outputs = outputs.transpose(0, 1)  # T B C
-            logits = torch.mean(outputs, dim=0)  # B C
+            _, outputs = model(input_ids)
+            logits = torch.mean(outputs, dim=1)  # B C
 
             loss = F.cross_entropy(logits, labels)
             losses.append(loss.item())
@@ -123,7 +125,7 @@ def train(args):
         scheduler.step()
 
         # Evaluate
-        acc = _evaluate(model, test_loader, tokenizer, args, device)
+        acc = _evaluate(model, test_loader, device)
         print(f"Epoch {epoch+1}: avg_loss={np.mean(losses):.4f}, test_acc={acc:.4f}")
 
         if acc >= best_acc:
@@ -139,27 +141,20 @@ def train(args):
     print(f"\nBest test accuracy: {best_acc:.4f}")
 
 
-def _evaluate(model, data_loader, tokenizer, args, device):
+def _evaluate(model, data_loader, device):
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for batch in data_loader:
-            messages, labels = batch
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
 
-            _, outputs = model(inputs['input_ids'])
-            outputs = outputs.to("cpu")
-            outputs = outputs.reshape(-1, args.num_step, args.label_num)
-            outputs = outputs.transpose(0, 1)
-            logits = torch.mean(outputs, dim=0)
+            _, outputs = model(input_ids)
+            logits = torch.mean(outputs, dim=1)
 
             preds = torch.argmax(logits, dim=-1)
-            correct += (preds == labels).sum().item()
+            correct += (preds == labels.to(device)).sum().item()
             total += len(labels)
             functional.reset_net(model)
 

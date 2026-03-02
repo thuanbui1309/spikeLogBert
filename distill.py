@@ -27,8 +27,8 @@ from transformers import BertTokenizer, BertForSequenceClassification
 from spikingjelly.activation_based import functional
 
 from model import SpikeLogBERT
-from data.dataset import LogParsingDataset
-from utils import set_seed, to_device, check_and_create_path
+from data.dataset import TokenizedLogParsingDataset
+from utils import set_seed, check_and_create_path
 
 
 def parse_args():
@@ -45,7 +45,7 @@ def parse_args():
     parser.add_argument("--depths", type=int, default=6)
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--max_length", type=int, default=128)
-    parser.add_argument("--num_step", type=int, default=16, help="SNN timesteps (T)")
+    parser.add_argument("--num_step", type=int, default=4, help="SNN timesteps (T)")
     parser.add_argument("--tau", type=float, default=10.0)
     parser.add_argument("--common_thr", type=float, default=1.0)
 
@@ -53,10 +53,11 @@ def parse_args():
     parser.add_argument("--predistill_model_path", type=str, default="")
 
     # Training
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
 
     # Loss weights
     parser.add_argument("--ce_weight", type=float, default=0.1)
@@ -105,60 +106,63 @@ def distill(args):
     student_model = student_model.to(device)
 
     # ---- Optimizer ----
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     optimizer = optim.AdamW(student_model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=5e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0)
 
-    # ---- Data ----
-    train_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "train.txt"))
-    test_dataset = LogParsingDataset(os.path.join(args.dataset_dir, "test.txt"))
+    # ---- Data (pre-tokenized) ----
+    train_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "train.txt"), tokenizer, args.max_length
+    )
+    test_dataset = TokenizedLogParsingDataset(
+        os.path.join(args.dataset_dir, "test.txt"), tokenizer, args.max_length
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False
+    )
 
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
     # ---- Training loop ----
     best_acc = 0.0
-    acc_list = []
 
     for epoch in range(args.epochs):
         student_model.train()
         loss_logs = {"total": [], "ce": [], "emb": [], "logit": [], "rep": []}
 
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            messages, labels = batch
-            batch_size = len(messages)
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
             labels = labels.to(device)
+            batch_size = input_ids.size(0)
 
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
-
-            # Teacher forward
+            # Teacher forward (no tokenization needed — already have input_ids)
             with torch.no_grad():
-                teacher_outputs = teacher_model(**inputs)
+                teacher_outputs = teacher_model(
+                    input_ids=input_ids, attention_mask=attention_mask
+                )
 
-            # Get teacher embeddings
+            # Embedding loss
             tea_embeddings = teacher_model.bert.embeddings.word_embeddings.weight
             if len(device_ids) > 1:
                 stu_embeddings = student_model.module.emb.weight
             else:
                 stu_embeddings = student_model.emb.weight
-
-            # Embedding loss
             emb_loss = F.mse_loss(stu_embeddings, tea_embeddings)
 
             # Student forward
             tea_rep = teacher_outputs.hidden_states[1:][::int(12 / args.depths)]
-            stu_rep, student_outputs = student_model(inputs['input_ids'])
+            stu_rep, student_outputs = student_model(input_ids)
 
-            # Reshape student outputs: (B*T, C) → (B, T, C) → mean over T
-            student_outputs = student_outputs.reshape(-1, args.num_step, args.label_num)
-            student_outputs = student_outputs.transpose(0, 1)  # T B C
-            student_logits = torch.mean(student_outputs, dim=0)  # B C
+            # Reshape student outputs: (B, T, C) → mean over T
+            student_logits = torch.mean(student_outputs, dim=1)  # B C
 
             # CE loss
             ce_loss = F.cross_entropy(student_logits, labels)
@@ -170,11 +174,8 @@ def distill(args):
                 reduction='batchmean'
             )
 
-            # Representation distillation loss
-            tea_rep_tensor = torch.tensor(
-                np.array([item.cpu().detach().numpy() for item in tea_rep]),
-                dtype=torch.float32
-            ).to(device)
+            # Representation distillation loss (torch.stack on GPU, no numpy!)
+            tea_rep_tensor = torch.stack(list(tea_rep))  # (num_layers, B, L, D)
 
             rep_loss = 0
             tea_rep_subset = tea_rep_tensor[args.ignored_layers:]
@@ -208,8 +209,7 @@ def distill(args):
         scheduler.step()
 
         # ---- Evaluate ----
-        acc = _evaluate_snn(student_model, test_loader, tokenizer, args, device)
-        acc_list.append(acc)
+        acc = _evaluate_snn(student_model, test_loader, args, device)
         print(
             f"Epoch {epoch+1}: "
             f"total={np.mean(loss_logs['total']):.4f}, "
@@ -233,28 +233,21 @@ def distill(args):
     print(f"\nBest test accuracy: {best_acc:.4f}")
 
 
-def _evaluate_snn(model, data_loader, tokenizer, args, device):
-    """Evaluate SNN model accuracy."""
+def _evaluate_snn(model, data_loader, args, device):
+    """Evaluate SNN model accuracy (pre-tokenized data)."""
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
         for batch in data_loader:
-            messages, labels = batch
-            inputs = tokenizer(
-                list(messages), padding="max_length", truncation=True,
-                return_tensors="pt", max_length=args.max_length
-            )
-            to_device(inputs, device)
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
 
-            _, outputs = model(inputs['input_ids'])
-            outputs = outputs.to("cpu")
-            outputs = outputs.reshape(-1, args.num_step, args.label_num)
-            outputs = outputs.transpose(0, 1)  # T B C
-            logits = torch.mean(outputs, dim=0)  # B C
+            _, outputs = model(input_ids)
+            logits = torch.mean(outputs, dim=1)  # B C
 
             preds = torch.argmax(logits, dim=-1)
-            correct += (preds == labels).sum().item()
+            correct += (preds == labels.to(device)).sum().item()
             total += len(labels)
 
             functional.reset_net(model)

@@ -8,33 +8,35 @@ Data format (train.txt / test.txt):
 """
 
 import os
+import torch
 import pandas as pd
 from torch.utils.data import Dataset
 from sklearn.model_selection import train_test_split
 
 
+def _load_samples(data_path: str):
+    """Load tab-separated (message, label) pairs from file."""
+    samples = []
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                samples.append((parts[0], int(parts[1])))
+    return samples
+
+
 class LogParsingDataset(Dataset):
     """
     Dataset for log parsing as text classification.
-
-    Each sample is a (log_message, template_id) pair.
-    Expects a tab-separated text file with format:
-        <log message>\t<template_id>
+    Returns raw (message_string, label_int) pairs.
     """
 
     def __init__(self, data_path: str):
         super().__init__()
-        self.samples = []
-        with open(data_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split('\t')
-                if len(parts) >= 2:
-                    message = parts[0]
-                    label = int(parts[1])
-                    self.samples.append((message, label))
+        self.samples = _load_samples(data_path)
 
     def __len__(self):
         return len(self.samples)
@@ -42,6 +44,36 @@ class LogParsingDataset(Dataset):
     def __getitem__(self, index):
         message, label = self.samples[index]
         return message, label
+
+
+class TokenizedLogParsingDataset(Dataset):
+    """
+    Pre-tokenized dataset — tokenizes ALL messages once at init time.
+    Returns (input_ids, attention_mask, label) tensors directly.
+
+    This eliminates the CPU tokenizer bottleneck from the training loop.
+    """
+
+    def __init__(self, data_path: str, tokenizer, max_length: int = 128):
+        super().__init__()
+        samples = _load_samples(data_path)
+        messages = [s[0] for s in samples]
+        self.labels = torch.tensor([s[1] for s in samples], dtype=torch.long)
+
+        print(f"Pre-tokenizing {len(messages)} messages (max_length={max_length})...")
+        encoded = tokenizer(
+            messages, padding="max_length", truncation=True,
+            return_tensors="pt", max_length=max_length
+        )
+        self.input_ids = encoded["input_ids"]       # (N, L)
+        self.attention_mask = encoded["attention_mask"]  # (N, L)
+        print(f"  Done. Shape: {self.input_ids.shape}")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        return self.input_ids[index], self.attention_mask[index], self.labels[index]
 
 
 def create_log_parsing_data(
